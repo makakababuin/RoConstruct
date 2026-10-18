@@ -667,28 +667,26 @@ def make_handler(store, token, can_verify, mine_log=None, server_mine_log=None):
             if path == "/v1/submit":
                 client, addr = str(body.get("client", "")), str(body.get("addr", ""))
                 source, claimed = str(body.get("source", "")), int(body.get("score", 0))
+                if not re.fullmatch(r"[0-9a-fA-F]{8}", addr):
+                    return self.send(400, {"error": "bad address"})
                 if not source.strip() or len(source) > 200_000:
                     return self.send(400, {"error": "empty or huge source"})
+                if client not in can_verify:
+                    return self.send(400, {"error": "server cannot verify client %s (compiler not installed)" % client})
                 score, verified, spans = claimed, False, None
                 previous = (store.best(client, addr) or {}).get("score", 0)
-                if client in can_verify:
-                    if not verification_slots.acquire(blocking=False):
-                        return self.send(503, {"error": "verification queue busy; retry shortly"})
+                if not verification_slots.acquire(blocking=False):
+                    return self.send(503, {"error": "verification queue busy; retry shortly"})
+                try:
                     try:
-                        try:
-                            score, _, _, spans = match.check_text(client, addr, source)
-                            verified = True
-                        except match.CompileError as error:
-                            return self.send(400, {"error": "does not compile here: %s" % str(error)[:500]})
-                        except SystemExit as error:
-                            return self.send(400, {"error": str(error)})
-                    finally:
-                        verification_slots.release()
-                else:
-                    try:
-                        match.reject_asm(source)
+                        score, _, _, spans = match.check_text(client, addr, source)
+                        verified = True
                     except match.CompileError as error:
+                        return self.send(400, {"error": "does not compile here: %s" % str(error)[:500]})
+                    except SystemExit as error:
                         return self.send(400, {"error": str(error)})
+                finally:
+                    verification_slots.release()
                 try:
                     stored, improved = store.submit(client, addr, user, max(0, min(100, score)), source, spans,
                                                     str(body.get("lease", "")) or None,
