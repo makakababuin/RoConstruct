@@ -156,7 +156,14 @@ def data_check(client, addr, code, refs):
         rva = va - base
         if not 0 <= rva < len(image) or not data:
             continue
+        if rva + len(data) > len(image):
+            bad.append("data at %08x exceeds binary image bounds" % va)
+            continue
         exe = bytes(image[rva:rva + len(data)])
+        inner_invalid = [r for r in inner if (va + r) not in exe_relocs]
+        if inner_invalid:
+            bad.append("data at %08x defines invalid relocations: %r" % (va, inner_invalid))
+            continue
         mask = set(inner) | {r - va for r in exe_relocs if va <= r < va + len(data)}
         if masked(exe, mask) == masked(data, mask):
             ok.append((va, len(data)))
@@ -177,7 +184,24 @@ def exact_match(target, target_relocs, cand, cand_relocs):
 
     This is the only verification signal. Everything else is a fuzzy hint.
     """
-    mask = set(target_relocs) | set(cand_relocs)
+    if len(target) != len(cand):
+        return False
+    target_set = set(target_relocs)
+    cand_set = set(cand_relocs)
+    for r in target_set | cand_set:
+        if r < 0 or r + 4 > len(target):
+            return False
+    for r in cand_set - target_set:
+        is_rel_call = (r >= 1 and target[r - 1] == 0xe8 and cand[r - 1] == 0xe8)
+        is_rel_jmp = (r >= 1 and target[r - 1] == 0xe9 and cand[r - 1] == 0xe9)
+        is_rel_jcc = (r >= 2 and target[r - 2] == 0x0f and cand[r - 2] == 0x0f and
+                      0x80 <= target[r - 1] <= 0x8f and target[r - 1] == cand[r - 1])
+        if not (is_rel_call or is_rel_jmp or is_rel_jcc):
+            return False
+    for r in target_set - cand_set:
+        if target[r:r + 4] != cand[r:r + 4]:
+            return False
+    mask = target_set | cand_set
     return masked(target, mask) == masked(cand, mask)
 
 
@@ -669,12 +693,27 @@ def reject_asm(text):
     """Inline asm would 'match' without decompiling anything. Sources also arrive
     from servers and AI, so anything that reads other files on this PC is refused
     (only `#include <system header>` is allowed)."""
-    if re.search(r"__asm|\b_asm\b|\b_emit\b|#pragma\s+code_seg", text):
+    clean = re.sub(r"\\(?:\r\n|\n|\r)", "", text)
+    if re.search(r"__asm|\b_asm\b|\b_emit\b|#\s*pragma\s+code_seg|__pragma\s*\(\s*code_seg", clean):
         raise CompileError("inline asm / _emit is not allowed: write C++")
-    if re.search(r'#\s*(import|using)\b|#\s*include\s*"|#\s*pragma\s+(comment|include_alias)', text):
+    if re.search(r'#\s*(import|using)\b|#\s*include\s*"|#\s*pragma\s+(comment|include_alias)|__pragma\s*\(\s*(comment|include_alias)', clean):
         raise CompileError('#import, #using, #include "file" and #pragma comment are not allowed. '
                            'Use // roc-lib: RECIPE relative/file.cpp for authentic vendor sources; '
                            'generate the candidate with libs.source_for. Register edited vendor units with libs.add_unit.')
+    if re.search(r"##\s*(?:asm|_asm|emit|_emit)\b|\b(?:__|_)##\s*asm\b", clean, re.I):
+        raise CompileError("macro token concatenation targeting asm/_emit is not allowed")
+
+
+_DANGEROUS_FLAG_PREFIXES = ("/B", "-B", "@", "/Fa", "/FA", "/Fo", "/FO", "/Fe", "/FE", "/Fp", "/FP",
+                            "/FR", "/Fr", "/link", "/LINK")
+
+
+def sanitize_flags(flags):
+    """Ensure compiler flags from roc-flags do not contain process substitution, response files, or file overwrites."""
+    for token in flags.split():
+        if any(token.startswith(bad) for bad in _DANGEROUS_FLAG_PREFIXES):
+            raise CompileError("disallowed compiler flag in roc-flags: %s" % token)
+    return flags
 
 
 def directives(text):
@@ -703,6 +742,7 @@ def compile_text(client, text, flags=None, build=None):
         except SystemExit as error:  # local-only tree (e.g. rbxgs) not on this PC
             raise CompileError(str(error))
     flags = flags or d.get("flags") or entry.get("flags") or DEFAULT_FLAGS
+    flags = sanitize_flags(flags)
     compile_fn = _compile if _cacheable(text) else _compile_uncached
     return compile_fn(text, flags, build, d.get("lang") == "c")
 
@@ -785,6 +825,16 @@ def _compile_uncached(text, flags, build, c_lang):
     with compile_directory() as tmp:
         src, obj = Path(tmp) / ("f.c" if c_lang else "f.cpp"), Path(tmp) / "f.obj"
         src.write_text(text)
+        if "#define" in text and "##" in text:
+            try:
+                prep = subprocess.run([*setup.cl_command(cl), "/nologo", "/EP",
+                                       *[f for f in flags.split() if f.startswith(("/D", "/I", "/U"))],
+                                       setup.cl_path(src)],
+                                      capture_output=True, text=True, env=env, cwd=tmp, timeout=30)
+                if prep.returncode == 0:
+                    reject_asm(prep.stdout)
+            except subprocess.TimeoutExpired:
+                pass
         try:
             run = subprocess.run([*setup.cl_command(cl), "/nologo", "/c", "/Gy", *flags.split(),
                                   "/Fo" + setup.cl_path(obj), setup.cl_path(src)],
@@ -847,21 +897,34 @@ def select_exact_data(client, addr, code, obj, candidates):
 def check_text(client, addr, text, flags=None, include_diagnosis=False, obj=None):
     """(score, symbol, asm diff, data spans) for the best function in text vs the target.
     A byte-identical function whose own strings/constants differ from the exe scores 99."""
-    code, relocs, _ = target(client, addr)
+    code, relocs, target_row = target(client, addr)
     obj = compile_text(client, text, flags) if obj is None else obj
     funcs = coff_functions(obj)
     if not funcs:
         result = (0, None, "no functions compiled (is the function body empty or inline?)", [])
         return result + ({},) if include_diagnosis else result
-    scored = [(score(code, relocs, f[1], f[2]), f) for f in funcs]
+
+    addr_clean = addr.lower().replace("0x", "").zfill(8)
+    explicit_func = [f for f in funcs if f[0] == f"func_{addr_clean}" or
+                     re.search(r"func_%s\b" % re.escape(addr_clean), f[0], re.I)]
+    eval_funcs = explicit_func if explicit_func else funcs
+
+    scored = [(score(code, relocs, f[1], f[2]), f) for f in eval_funcs]
     highest = max(value for value, _ in scored)
-    # Alignment only breaks byte-score ties; don't align losing candidates.
-    best = max((f for value, f in scored if value == highest),
-               key=lambda f: rank_candidate(code, relocs, f[1], f[2]))
+    unit_name = (target_row.get("unit") or "").lower()
+    def candidate_tiebreaker(f):
+        sym = f[0].lower()
+        has_addr = 1 if addr_clean in sym else 0
+        has_unit = 1 if (unit_name and not unit_name.startswith("seg_") and unit_name in sym) else 0
+        rank = rank_candidate(code, relocs, f[1], f[2])
+        return (has_addr, has_unit, rank[0], rank[1], rank[2])
+
+    best = max((f for value, f in scored if value == highest), key=candidate_tiebreaker)
     value, d, spans = score(code, relocs, best[1], best[2]), diff(code, relocs, best[1], best[2]), []
     bad = []
     if value == 100:
         exacts = [best] + [f for score_value, f in scored if score_value == 100 and f is not best]
+        exacts.sort(key=candidate_tiebreaker, reverse=True)
         best, spans, bad = select_exact_data(client, addr, code, obj, exacts)
         d = diff(code, relocs, best[1], best[2])
         if bad:
